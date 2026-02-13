@@ -67,17 +67,12 @@ async def pdf_to_words(file: UploadFile = File(...)):
     out = []
 
     for t in merged:
-        # clean_token() should:
-        # - remove special characters
-        # - strip whitespace
-        # - possibly remove soft hyphen (\u00ad)
+        # clean_token() should remove special chars, strip whitespaces and remove soft hyphens
         ct = clean_token(t)
 
         # Only keep non-empty tokens
         if ct:
             out.append(ct)
 
-    # Return:
-    # - total number of cleaned words
-    # - first 5000 words (to avoid huge JSON responses)
+    # Return total number of cleaned words and first 5000 words
     return {"n_words": len(out), "words": out[:5000]}
