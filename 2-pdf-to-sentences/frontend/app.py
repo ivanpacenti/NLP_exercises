@@ -15,11 +15,11 @@ REQUEST_TIMEOUT_SECONDS = 10.0
 
 #call to the pdf_service endpoint
 async def call_external_pdf_words(service_url: str, file: UploadFile) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    endpoint = service_url.rstrip("/") + "/v1/pdf-to-words"
+    endpoint = service_url.rstrip("/") + "/v1/extract-sentences"
     t0 = time.perf_counter()
     try:
         content = await file.read()
-        files = {"file": (file.filename or "upload.pdf", content, file.content_type or "application/pdf")}
+        files = {"pdf_file": (file.filename or "upload.pdf", content, file.content_type or "application/pdf")}
 
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             r = await client.post(endpoint, files=files)
@@ -104,51 +104,51 @@ async def api_pdf_words(service_url: str = Form(...), file: UploadFile = File(..
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>DTU PDF Words Demo</title>
+  <title>DTU PDF Sentences Demo</title>
   <style>
-    :root {{
+    :root {
       --dtu-red: rgb(153,0,0);
       --bg: #ffffff;
       --fg: #111111;
       --muted: #666666;
       --card: #f6f6f6;
       --border: #dddddd;
-    }}
-    body {{
+    }
+    body {
       margin: 0;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
       color: var(--fg);
       background: var(--bg);
-    }}
-    header {{
+    }
+    header {
       background: var(--dtu-red);
       color: white;
       padding: 14px 18px;
-    }}
-    main {{
+    }
+    main {
       max-width: 900px;
       margin: 18px auto;
       padding: 0 14px 30px 14px;
-    }}
-    .card {{
+    }
+    .card {
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 14px;
-    }}
-    label {{
+    }
+    label {
       display: block;
       font-size: 12px;
       color: var(--muted);
       margin-bottom: 6px;
       margin-top: 10px;
-    }}
-    input[type="text"], input[type="file"] {{
+    }
+    input[type="text"], input[type="file"] {
       width: 100%;
       box-sizing: border-box;
       border: 1px solid var(--border);
@@ -158,8 +158,8 @@ def index() -> str:
       background: white;
       color: var(--fg);
       outline: none;
-    }}
-    button {{
+    }
+    button {
       margin-top: 12px;
       border: 0;
       border-radius: 10px;
@@ -168,47 +168,47 @@ def index() -> str:
       cursor: pointer;
       background: var(--dtu-red);
       color: white;
-    }}
-    .result {{
+    }
+    .result {
       margin-top: 12px;
       background: white;
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 10px;
-    }}
-    .mono {{
+    }
+    .mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size: 12px;
       white-space: pre-wrap;
       word-break: break-word;
-    }}
-    .error {{
+    }
+    .error {
       border: 1px solid rgba(153,0,0,0.35);
       background: rgba(153,0,0,0.06);
       color: #4a0000;
       padding: 10px;
       border-radius: 12px;
       margin-top: 10px;
-    }}
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1 style="margin:0; font-size:18px;">DTU PDF Words Demo</h1>
+    <h1 style="margin:0; font-size:18px;">DTU PDF Sentences Demo</h1>
     <p style="margin:6px 0 0 0; font-size:13px; opacity:0.9;">
-      Upload a PDF and show the external service response (expects <span class="mono">/v1/pdf-to-words</span>).
+      Upload a PDF and show the external service response (expects <span class="mono">/v1/extract-sentences</span>).
     </p>
   </header>
 
   <main>
     <div class="card">
       <label for="serviceUrl">External service base URL</label>
-      <input id="serviceUrl" type="text" value="{DEFAULT_SERVICE_URL}" />
+      <input id="serviceUrl" type="text" />
 
       <label for="pdfFile">PDF file</label>
       <input id="pdfFile" type="file" accept="application/pdf" />
 
-      <button id="pdfBtn">Upload & extract words</button>
+      <button id="pdfBtn">Upload & extract sentences</button>
 
       <div id="pdfResult" class="result" style="display:none;"></div>
       <div id="pdfError" class="error" style="display:none;"></div>
@@ -216,71 +216,74 @@ def index() -> str:
   </main>
 
   <script>
-    function escapeHtml(s) {{
+    // default base URL inside docker-compose network
+    document.getElementById("serviceUrl").value = "http://pdf_service:8000";
+
+    function escapeHtml(s) {
       s = String(s);
       return s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
-    }}
-    function setVisible(id, visible) {{
+    }
+    function setVisible(id, visible) {
       document.getElementById(id).style.display = visible ? "" : "none";
-    }}
-    function showPdfError(msg) {{
+    }
+    function showPdfError(msg) {
       const box = document.getElementById("pdfError");
-      box.innerHTML = `<strong>PDF request failed.</strong><br/><div style="margin-top:6px;">${{escapeHtml(msg)}}</div>`;
+      box.innerHTML = `<strong>PDF request failed.</strong><br/><div style="margin-top:6px;">${escapeHtml(msg)}</div>`;
       setVisible("pdfError", true);
-    }}
-    function clearPdf() {{
+    }
+    function clearPdf() {
       setVisible("pdfError", false);
       setVisible("pdfResult", false);
       document.getElementById("pdfResult").innerHTML = "";
-    }}
+    }
 
-    document.getElementById("pdfBtn").addEventListener("click", async () => {{
+    document.getElementById("pdfBtn").addEventListener("click", async () => {
       clearPdf();
 
       const serviceUrl = document.getElementById("serviceUrl").value.trim();
       const fileInput = document.getElementById("pdfFile");
       const file = fileInput.files && fileInput.files[0];
 
-      if (!serviceUrl) {{
+      if (!serviceUrl) {
         showPdfError("Please provide the base URL of the external service (e.g., http://localhost:8000).");
         return;
-      }}
-      if (!file) {{
+      }
+      if (!file) {
         showPdfError("Please choose a PDF file first.");
         return;
-      }}
+      }
 
       const form = new FormData();
       form.append("service_url", serviceUrl);
       form.append("file", file);
 
-      const r = await fetch("/api/pdf-words", {{ method: "POST", body: form }});
+      const r = await fetch("/api/pdf-words", { method: "POST", body: form });
       const data = await r.json();
 
-      if (!r.ok) {{
+      if (!r.ok) {
         showPdfError(data.detail || "Unknown error.");
         return;
-      }}
+      }
 
-      const payload = data.data || {{}};
-      const words = payload.words || payload.tokens || null;
+      const payload = data.data || {};
+      const sentences = payload.sentences || null;
 
       const box = document.getElementById("pdfResult");
       box.innerHTML = `
-        <div><strong>Latency:</strong> <span class="mono">${{data.latency_ms.toFixed(1)}} ms</span></div>
-        <div><strong>Endpoint:</strong> <span class="mono">${{escapeHtml(data.endpoint)}}</span></div>
+        <div><strong>Latency:</strong> <span class="mono">${data.latency_ms.toFixed(1)} ms</span></div>
+        <div><strong>Endpoint:</strong> <span class="mono">${escapeHtml(data.endpoint)}</span></div>
         <hr/>
-        ${{words ? `
-          <div><strong>Words (${{words.length}}):</strong></div>
-          <div class="mono" style="margin-top:6px;">${{escapeHtml(words.join(" "))}}</div>
+        ${sentences ? `
+          <div><strong>Sentences (${sentences.length}):</strong></div>
+          <div class="mono" style="margin-top:6px;">${escapeHtml(sentences.join("\\n"))}</div>
         ` : `
-          <div><strong>No words/tokens field found.</strong> Showing raw JSON:</div>
-        `}}
+          <div><strong>No sentences field found.</strong></div>
+        `}
         <div style="margin-top:10px;"><strong>Raw JSON:</strong></div>
-        <div class="mono" style="margin-top:6px;">${{escapeHtml(JSON.stringify(payload, null, 2))}}</div>
+        <div class="mono" style="margin-top:6px;">${escapeHtml(JSON.stringify(payload, null, 2))}</div>
       `;
       setVisible("pdfResult", true);
-    }});
+    });
   </script>
 </body>
 </html>"""
