@@ -102,7 +102,7 @@ async def get_political_party(qid: str) -> List[Dict[str, str]]:
 async def get_supervisors(qid: str) -> List[Dict[str, str]]:
     query = f"""
     SELECT ?supervisor ?supervisorLabel WHERE {{
-      wd:{qid} wdt:P185 ?supervisor .
+      wd:{qid} wdt:P184 ?supervisor .
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
     }}
     """
