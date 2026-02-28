@@ -2,8 +2,10 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+
+
 class PersonRequest(BaseModel):
-    person: str = Field(...)
+    person: str
     context: Optional[str] = None
 
 
