@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing
+.pytest_cache/
+
+# Type checking
+.mypy_cache/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+
+# OS
+.DS_Store
+
+# Data files (DTU courses)
+dtu_courses*
+
+# Downloaded data
+*.warc.gz
+
+# Model cache (sentence-transformers)
+.cache/
+models/
+sentence_transformers_cache/
+
+# General cache
+cache/
