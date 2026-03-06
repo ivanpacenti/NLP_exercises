@@ -2,8 +2,10 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -13,6 +15,9 @@ app = FastAPI()
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 DENSE_DIM = 256
 DATA_PATH = Path(__file__).with_name("dtu_courses.jsonl")
+# BM25 hyperparameters (standard defaults used in IR literature)
+BM25_K1 = 1.5
+BM25_B = 0.75
 
 
 class CourseResult(BaseModel):
@@ -53,18 +58,36 @@ class HealthResponse(BaseModel):
 
 
 COURSES: Dict[str, Dict[str, object]] = {}
-COURSE_SPARSE_VECTORS: Dict[str, Dict[str, float]] = {}
 COURSE_DENSE_VECTORS: Dict[str, List[float]] = {}
-COURSE_IDF: Dict[str, float] = {}
+COURSE_TERM_FREQS: Dict[str, Dict[str, int]] = {}
+COURSE_DOC_LEN: Dict[str, int] = {}
+COURSE_BM25_IDF: Dict[str, float] = {}
+COURSE_AVG_DL: float = 1.0
 
 OBJECTIVE_DOCS: List[Dict[str, str]] = []
-OBJECTIVE_SPARSE_VECTORS: List[Dict[str, float]] = []
 OBJECTIVE_DENSE_VECTORS: List[List[float]] = []
-OBJECTIVE_IDF: Dict[str, float] = {}
+OBJECTIVE_TERM_FREQS: List[Dict[str, int]] = []
+OBJECTIVE_DOC_LEN: List[int] = []
+OBJECTIVE_BM25_IDF: Dict[str, float] = {}
+OBJECTIVE_AVG_DL: float = 1.0
+
+
+def _normalize_text(text: str) -> str:
+    # Normalize accents/diacritics so queries like "bjorn" match "Bjørn".
+    normalized = unicodedata.normalize("NFKD", text)
+    without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return without_accents.lower()
 
 
 def _tokenize(text: str) -> List[str]:
-    return TOKEN_RE.findall(text.lower())
+    return TOKEN_RE.findall(_normalize_text(text))
+
+
+def _tokenize_sparse(text: str) -> List[str]:
+    # Sparse retrieval uses unigrams + bigrams to capture short phrases/names.
+    tokens = _tokenize(text)
+    bigrams = [f"{tokens[i]}_{tokens[i + 1]}" for i in range(len(tokens) - 1)]
+    return tokens + bigrams
 
 
 def _dense_hash(token: str, dim: int = DENSE_DIM) -> int:
@@ -80,43 +103,8 @@ def _dot_dense(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
-def _dot_sparse(a: Dict[str, float], b: Dict[str, float]) -> float:
-    if len(a) > len(b):
-        a, b = b, a
-    return sum(v * b.get(k, 0.0) for k, v in a.items())
-
-
-def _build_idf(token_lists: List[List[str]]) -> Dict[str, float]:
-    doc_freq: Dict[str, int] = {}
-    for tokens in token_lists:
-        for term in set(tokens):
-            doc_freq[term] = doc_freq.get(term, 0) + 1
-
-    num_docs = max(1, len(token_lists))
-    return {
-        term: math.log((1 + num_docs) / (1 + df)) + 1.0
-        for term, df in doc_freq.items()
-    }
-
-
-def _build_sparse_vector(tokens: List[str], idf: Dict[str, float]) -> Dict[str, float]:
-    tf: Dict[str, int] = {}
-    for tok in tokens:
-        tf[tok] = tf.get(tok, 0) + 1
-
-    vec: Dict[str, float] = {}
-    for tok, cnt in tf.items():
-        vec[tok] = float(cnt) * idf.get(tok, 1.0)
-
-    norm = math.sqrt(sum(v * v for v in vec.values()))
-    if norm > 0:
-        for tok in list(vec.keys()):
-            vec[tok] /= norm
-
-    return vec
-
-
 def _build_dense_vector(tokens: List[str]) -> List[float]:
+    # Lightweight dense embedding via hashing trick (no external model download).
     vec = [0.0] * DENSE_DIM
     for tok in tokens:
         vec[_dense_hash(tok)] += 1.0
@@ -128,36 +116,105 @@ def _build_dense_vector(tokens: List[str]) -> List[float]:
     return vec
 
 
-def _query_sparse_vector(query: str, idf: Dict[str, float]) -> Dict[str, float]:
-    return _build_sparse_vector(_tokenize(query), idf)
+def _normalize_scores(values: List[float]) -> List[float]:
+    # Min-max normalization used before hybrid combination.
+    if not values:
+        return []
+
+    vmin = min(values)
+    vmax = max(values)
+    if math.isclose(vmin, vmax):
+        return [0.0 for _ in values]
+
+    return [(v - vmin) / (vmax - vmin) for v in values]
 
 
-def _query_dense_vector(query: str) -> List[float]:
-    return _build_dense_vector(_tokenize(query))
+def _build_bm25_stats(token_lists: List[List[str]]) -> Tuple[List[Dict[str, int]], List[int], Dict[str, float], float]:
+    # Precompute BM25 statistics: tf per doc, doc length, idf, average doc length.
+    n_docs = len(token_lists)
+    term_freqs: List[Dict[str, int]] = []
+    doc_lens: List[int] = []
+    df: Dict[str, int] = {}
+
+    for tokens in token_lists:
+        tf = dict(Counter(tokens))
+        term_freqs.append(tf)
+        doc_lens.append(len(tokens))
+        for term in tf:
+            df[term] = df.get(term, 0) + 1
+
+    avg_dl = sum(doc_lens) / n_docs if n_docs else 1.0
+
+    idf = {
+        term: math.log(1.0 + (n_docs - freq + 0.5) / (freq + 0.5))
+        for term, freq in df.items()
+    }
+
+    return term_freqs, doc_lens, idf, avg_dl
 
 
-def _hybrid_score(sparse_score: float, dense_score: float, mode: str, alpha: float) -> float:
-    if mode == "sparse":
-        return sparse_score
-    if mode == "dense":
-        return dense_score
-    return alpha * dense_score + (1.0 - alpha) * sparse_score
+def _bm25_score(
+    query_tokens: List[str],
+    doc_tf: Dict[str, int],
+    doc_len: int,
+    idf: Dict[str, float],
+    avg_dl: float,
+) -> float:
+    # Standard BM25 scoring for one query against one document.
+    if not query_tokens:
+        return 0.0
+
+    qtf = Counter(query_tokens)
+    score = 0.0
+
+    for term, q_weight in qtf.items():
+        tf = doc_tf.get(term, 0)
+        if tf == 0:
+            continue
+
+        term_idf = idf.get(term, 0.0)
+        denom = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * (doc_len / max(avg_dl, 1e-9)))
+        score += term_idf * ((tf * (BM25_K1 + 1.0)) / max(denom, 1e-9)) * q_weight
+
+    return score
+
+
+def _collect_field_text(value: object) -> str:
+    # Flatten nested JSON values (dict/list/str) into a searchable text string.
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(_collect_field_text(v) for v in value)
+    if isinstance(value, dict):
+        return " ".join(_collect_field_text(v) for v in value.values())
+    return ""
+
+
+def _hybrid_scores(sparse_scores: List[float], dense_scores: List[float], alpha: float) -> List[float]:
+    # Combine sparse and dense scores after normalization:
+    # final = alpha * dense + (1 - alpha) * sparse
+    sparse_norm = _normalize_scores(sparse_scores)
+    dense_norm = _normalize_scores(dense_scores)
+    return [alpha * d + (1.0 - alpha) * s for s, d in zip(sparse_norm, dense_norm)]
 
 
 def _build_indexes() -> None:
     global COURSES
-    global COURSE_SPARSE_VECTORS, COURSE_DENSE_VECTORS, COURSE_IDF
-    global OBJECTIVE_DOCS, OBJECTIVE_SPARSE_VECTORS, OBJECTIVE_DENSE_VECTORS, OBJECTIVE_IDF
+    global COURSE_DENSE_VECTORS, COURSE_TERM_FREQS, COURSE_DOC_LEN, COURSE_BM25_IDF, COURSE_AVG_DL
+    global OBJECTIVE_DOCS, OBJECTIVE_DENSE_VECTORS, OBJECTIVE_TERM_FREQS, OBJECTIVE_DOC_LEN
+    global OBJECTIVE_BM25_IDF, OBJECTIVE_AVG_DL
 
     if not DATA_PATH.exists():
         raise RuntimeError(f"Dataset not found: {DATA_PATH}")
 
     courses: Dict[str, Dict[str, object]] = {}
     course_ids: List[str] = []
-    course_tokens_all: List[List[str]] = []
+    course_sparse_tokens_all: List[List[str]] = []
+    course_dense_tokens_all: List[List[str]] = []
 
     objective_docs: List[Dict[str, str]] = []
-    objective_tokens_all: List[List[str]] = []
+    objective_sparse_tokens_all: List[List[str]] = []
+    objective_dense_tokens_all: List[List[str]] = []
 
     for line in DATA_PATH.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -167,13 +224,14 @@ def _build_indexes() -> None:
 
         course_id = str(row.get("course_code", "")).strip()
         title = str(row.get("title", "")).strip()
-        objectives = row.get("learning_objectives", []) or []
+        objectives = [str(obj).strip() for obj in (row.get("learning_objectives", []) or []) if str(obj).strip()]
+        fields_text = _collect_field_text(row.get("fields", {}))
 
         if not course_id:
             continue
 
-        objectives = [str(obj).strip() for obj in objectives if str(obj).strip()]
-        full_text = f"{title} {' '.join(objectives)}".strip()
+        # Course-level searchable text includes title + objectives + metadata fields.
+        full_text = f"{title} {' '.join(objectives)} {fields_text}".strip()
 
         courses[course_id] = {
             "title": title,
@@ -182,7 +240,8 @@ def _build_indexes() -> None:
         }
 
         course_ids.append(course_id)
-        course_tokens_all.append(_tokenize(full_text))
+        course_sparse_tokens_all.append(_tokenize_sparse(full_text))
+        course_dense_tokens_all.append(_tokenize(full_text))
 
         for objective in objectives:
             objective_docs.append(
@@ -190,40 +249,117 @@ def _build_indexes() -> None:
                     "course_id": course_id,
                     "title": title,
                     "objective": objective,
-                    "text": objective,
                 }
             )
-            objective_tokens_all.append(_tokenize(objective))
+            objective_sparse_tokens_all.append(_tokenize_sparse(objective))
+            objective_dense_tokens_all.append(_tokenize(objective))
 
-    course_idf = _build_idf(course_tokens_all)
-    course_sparse_vectors = {
-        cid: _build_sparse_vector(tokens, course_idf)
-        for cid, tokens in zip(course_ids, course_tokens_all)
-    }
+    # Build course-level sparse (BM25) and dense indices.
+    course_term_freqs_list, course_doc_len_list, course_idf, course_avg_dl = _build_bm25_stats(course_sparse_tokens_all)
+    course_term_freqs = {cid: tf for cid, tf in zip(course_ids, course_term_freqs_list)}
+    course_doc_len = {cid: dl for cid, dl in zip(course_ids, course_doc_len_list)}
     course_dense_vectors = {
         cid: _build_dense_vector(tokens)
-        for cid, tokens in zip(course_ids, course_tokens_all)
+        for cid, tokens in zip(course_ids, course_dense_tokens_all)
     }
 
-    objective_idf = _build_idf(objective_tokens_all)
-    objective_sparse_vectors = [
-        _build_sparse_vector(tokens, objective_idf)
-        for tokens in objective_tokens_all
-    ]
-    objective_dense_vectors = [
-        _build_dense_vector(tokens)
-        for tokens in objective_tokens_all
-    ]
+    # Build objective-level sparse (BM25) and dense indices.
+    objective_term_freqs, objective_doc_len, objective_idf, objective_avg_dl = _build_bm25_stats(objective_sparse_tokens_all)
+    objective_dense_vectors = [_build_dense_vector(tokens) for tokens in objective_dense_tokens_all]
 
     COURSES = courses
-    COURSE_IDF = course_idf
-    COURSE_SPARSE_VECTORS = course_sparse_vectors
+    COURSE_TERM_FREQS = course_term_freqs
+    COURSE_DOC_LEN = course_doc_len
+    COURSE_BM25_IDF = course_idf
+    COURSE_AVG_DL = course_avg_dl
     COURSE_DENSE_VECTORS = course_dense_vectors
 
     OBJECTIVE_DOCS = objective_docs
-    OBJECTIVE_IDF = objective_idf
-    OBJECTIVE_SPARSE_VECTORS = objective_sparse_vectors
+    OBJECTIVE_TERM_FREQS = objective_term_freqs
+    OBJECTIVE_DOC_LEN = objective_doc_len
+    OBJECTIVE_BM25_IDF = objective_idf
+    OBJECTIVE_AVG_DL = objective_avg_dl
     OBJECTIVE_DENSE_VECTORS = objective_dense_vectors
+
+
+def rank_courses_for_query(
+    query: str,
+    top_k: int = 10,
+    mode: Literal["dense", "sparse", "hybrid"] = "hybrid",
+    alpha: float = 0.25,
+    exclude_course_id: Optional[str] = None,
+) -> List[Tuple[str, float]]:
+    # Internal ranker shared by /v1/search and /similar.
+    query_sparse = _tokenize_sparse(query)
+    query_dense = _build_dense_vector(_tokenize(query))
+
+    ids: List[str] = []
+    sparse_scores: List[float] = []
+    dense_scores: List[float] = []
+
+    for cid in COURSES:
+        if exclude_course_id and cid == exclude_course_id:
+            continue
+
+        ids.append(cid)
+        sparse_scores.append(
+            _bm25_score(
+                query_tokens=query_sparse,
+                doc_tf=COURSE_TERM_FREQS[cid],
+                doc_len=COURSE_DOC_LEN[cid],
+                idf=COURSE_BM25_IDF,
+                avg_dl=COURSE_AVG_DL,
+            )
+        )
+        dense_scores.append(_dot_dense(query_dense, COURSE_DENSE_VECTORS[cid]))
+
+    if mode == "sparse":
+        final_scores = sparse_scores
+    elif mode == "dense":
+        final_scores = dense_scores
+    else:
+        final_scores = _hybrid_scores(sparse_scores, dense_scores, alpha=alpha)
+
+    ranked = list(zip(ids, final_scores))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked[:top_k]
+
+
+def rank_objectives_for_query(
+    query: str,
+    top_k: int = 10,
+    mode: Literal["dense", "sparse", "hybrid"] = "hybrid",
+    alpha: float = 0.25,
+) -> List[Tuple[int, float]]:
+    # Internal ranker for objective-level retrieval.
+    query_sparse = _tokenize_sparse(query)
+    query_dense = _build_dense_vector(_tokenize(query))
+
+    sparse_scores: List[float] = []
+    dense_scores: List[float] = []
+
+    for idx in range(len(OBJECTIVE_DOCS)):
+        sparse_scores.append(
+            _bm25_score(
+                query_tokens=query_sparse,
+                doc_tf=OBJECTIVE_TERM_FREQS[idx],
+                doc_len=OBJECTIVE_DOC_LEN[idx],
+                idf=OBJECTIVE_BM25_IDF,
+                avg_dl=OBJECTIVE_AVG_DL,
+            )
+        )
+        dense_scores.append(_dot_dense(query_dense, OBJECTIVE_DENSE_VECTORS[idx]))
+
+    if mode == "sparse":
+        final_scores = sparse_scores
+    elif mode == "dense":
+        final_scores = dense_scores
+    else:
+        final_scores = _hybrid_scores(sparse_scores, dense_scores, alpha=alpha)
+
+    ranked = list(enumerate(final_scores))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked[:top_k]
 
 
 @app.on_event("startup")
@@ -235,70 +371,43 @@ def on_startup() -> None:
 def similar_courses(
     course_id: str,
     top_k: int = Query(10, ge=1, le=100),
-    mode: Literal["dense", "sparse", "hybrid"] = Query("dense"),
-    alpha: float = Query(0.5, ge=0.0, le=1.0),
+    mode: Literal["dense", "sparse", "hybrid"] = Query("sparse"),
+    alpha: float = Query(0.0, ge=0.0, le=1.0),
 ) -> SimilarResponse:
+    # Retrieve nearest courses by using the selected course text as query.
     if course_id not in COURSES:
         raise HTTPException(status_code=404, detail=f"Unknown course_id: {course_id}")
 
-    query_sparse = COURSE_SPARSE_VECTORS[course_id]
-    query_dense = COURSE_DENSE_VECTORS[course_id]
-
-    scored: List[Tuple[str, float]] = []
-    for cid in COURSES:
-        if cid == course_id:
-            continue
-
-        sparse_score = _dot_sparse(query_sparse, COURSE_SPARSE_VECTORS[cid])
-        dense_score = _dot_dense(query_dense, COURSE_DENSE_VECTORS[cid])
-        score = _hybrid_score(sparse_score, dense_score, mode, alpha)
-        scored.append((cid, score))
-
-    scored.sort(key=lambda item: item[1], reverse=True)
+    query_text = str(COURSES[course_id]["text"])
+    ranked = rank_courses_for_query(
+        query=query_text,
+        top_k=top_k,
+        mode=mode,
+        alpha=alpha,
+        exclude_course_id=course_id,
+    )
 
     results = [
-        CourseResult(
-            course_id=cid,
-            title=str(COURSES[cid]["title"]),
-            score=round(score, 3),
-        )
-        for cid, score in scored[:top_k]
+        CourseResult(course_id=cid, title=str(COURSES[cid]["title"]), score=round(score, 3))
+        for cid, score in ranked
     ]
 
-    return SimilarResponse(
-        query_course_id=course_id,
-        results=results,
-        mode=mode,
-        top_k=top_k,
-    )
+    return SimilarResponse(query_course_id=course_id, results=results, mode=mode, top_k=top_k)
 
 
 @app.get("/v1/search", response_model=SearchResponse)
 def search_courses(
     query: str = Query(..., min_length=1),
     top_k: int = Query(10, ge=1, le=100),
-    mode: Literal["dense", "sparse", "hybrid"] = Query("dense"),
-    alpha: float = Query(0.5, ge=0.0, le=1.0),
+    mode: Literal["dense", "sparse", "hybrid"] = Query("sparse"),
+    alpha: float = Query(0.0, ge=0.0, le=1.0),
 ) -> SearchResponse:
-    query_sparse = _query_sparse_vector(query, COURSE_IDF)
-    query_dense = _query_dense_vector(query)
-
-    scored: List[Tuple[str, float]] = []
-    for cid in COURSES:
-        sparse_score = _dot_sparse(query_sparse, COURSE_SPARSE_VECTORS[cid])
-        dense_score = _dot_dense(query_dense, COURSE_DENSE_VECTORS[cid])
-        score = _hybrid_score(sparse_score, dense_score, mode, alpha)
-        scored.append((cid, score))
-
-    scored.sort(key=lambda item: item[1], reverse=True)
+    # Free-text course search endpoint used by evaluation/UI.
+    ranked = rank_courses_for_query(query=query, top_k=top_k, mode=mode, alpha=alpha)
 
     results = [
-        CourseResult(
-            course_id=cid,
-            title=str(COURSES[cid]["title"]),
-            score=round(score, 3),
-        )
-        for cid, score in scored[:top_k]
+        CourseResult(course_id=cid, title=str(COURSES[cid]["title"]), score=round(score, 3))
+        for cid, score in ranked
     ]
 
     return SearchResponse(query=query, results=results, mode=mode)
@@ -308,20 +417,11 @@ def search_courses(
 def search_objectives(
     query: str = Query(..., min_length=1),
     top_k: int = Query(10, ge=1, le=100),
-    mode: Literal["dense", "sparse", "hybrid"] = Query("dense"),
-    alpha: float = Query(0.5, ge=0.0, le=1.0),
+    mode: Literal["dense", "sparse", "hybrid"] = Query("sparse"),
+    alpha: float = Query(0.0, ge=0.0, le=1.0),
 ) -> ObjectivesSearchResponse:
-    query_sparse = _query_sparse_vector(query, OBJECTIVE_IDF)
-    query_dense = _query_dense_vector(query)
-
-    scored: List[Tuple[int, float]] = []
-    for idx in range(len(OBJECTIVE_DOCS)):
-        sparse_score = _dot_sparse(query_sparse, OBJECTIVE_SPARSE_VECTORS[idx])
-        dense_score = _dot_dense(query_dense, OBJECTIVE_DENSE_VECTORS[idx])
-        score = _hybrid_score(sparse_score, dense_score, mode, alpha)
-        scored.append((idx, score))
-
-    scored.sort(key=lambda item: item[1], reverse=True)
+    # Free-text objective search returning (course, objective) matches.
+    ranked = rank_objectives_for_query(query=query, top_k=top_k, mode=mode, alpha=alpha)
 
     results = [
         ObjectiveResult(
@@ -330,7 +430,7 @@ def search_objectives(
             objective=OBJECTIVE_DOCS[idx]["objective"],
             score=round(score, 3),
         )
-        for idx, score in scored[:top_k]
+        for idx, score in ranked
     ]
 
     return ObjectivesSearchResponse(query=query, results=results, mode=mode)
