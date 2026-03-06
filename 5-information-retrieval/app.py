@@ -198,6 +198,30 @@ def _hybrid_scores(sparse_scores: List[float], dense_scores: List[float], alpha:
     return [alpha * d + (1.0 - alpha) * s for s, d in zip(sparse_norm, dense_norm)]
 
 
+def _rrf_scores(
+    sparse_scores: List[float],
+    dense_scores: List[float],
+    alpha: float,
+    k: int = 60,
+) -> List[float]:
+    # Reciprocal Rank Fusion on sparse and dense rankings.
+    # alpha is used as dense weight, (1-alpha) as sparse weight.
+    n = len(sparse_scores)
+    sparse_order = sorted(range(n), key=lambda i: sparse_scores[i], reverse=True)
+    dense_order = sorted(range(n), key=lambda i: dense_scores[i], reverse=True)
+
+    sparse_rank = {idx: rank for rank, idx in enumerate(sparse_order, start=1)}
+    dense_rank = {idx: rank for rank, idx in enumerate(dense_order, start=1)}
+
+    scores: List[float] = []
+    for idx in range(n):
+        s_part = (1.0 - alpha) / (k + sparse_rank[idx])
+        d_part = alpha / (k + dense_rank[idx])
+        scores.append(s_part + d_part)
+
+    return scores
+
+
 def _build_indexes() -> None:
     global COURSES
     global COURSE_DENSE_VECTORS, COURSE_TERM_FREQS, COURSE_DOC_LEN, COURSE_BM25_IDF, COURSE_AVG_DL
@@ -287,6 +311,7 @@ def rank_courses_for_query(
     top_k: int = 10,
     mode: Literal["dense", "sparse", "hybrid"] = "hybrid",
     alpha: float = 0.25,
+    fusion: Literal["linear", "rrf"] = "linear",
     exclude_course_id: Optional[str] = None,
 ) -> List[Tuple[str, float]]:
     # Internal ranker shared by /v1/search and /similar.
@@ -318,7 +343,10 @@ def rank_courses_for_query(
     elif mode == "dense":
         final_scores = dense_scores
     else:
-        final_scores = _hybrid_scores(sparse_scores, dense_scores, alpha=alpha)
+        if fusion == "rrf":
+            final_scores = _rrf_scores(sparse_scores, dense_scores, alpha=alpha)
+        else:
+            final_scores = _hybrid_scores(sparse_scores, dense_scores, alpha=alpha)
 
     ranked = list(zip(ids, final_scores))
     ranked.sort(key=lambda item: item[1], reverse=True)
@@ -330,6 +358,7 @@ def rank_objectives_for_query(
     top_k: int = 10,
     mode: Literal["dense", "sparse", "hybrid"] = "hybrid",
     alpha: float = 0.25,
+    fusion: Literal["linear", "rrf"] = "linear",
 ) -> List[Tuple[int, float]]:
     # Internal ranker for objective-level retrieval.
     query_sparse = _tokenize_sparse(query)
@@ -355,7 +384,10 @@ def rank_objectives_for_query(
     elif mode == "dense":
         final_scores = dense_scores
     else:
-        final_scores = _hybrid_scores(sparse_scores, dense_scores, alpha=alpha)
+        if fusion == "rrf":
+            final_scores = _rrf_scores(sparse_scores, dense_scores, alpha=alpha)
+        else:
+            final_scores = _hybrid_scores(sparse_scores, dense_scores, alpha=alpha)
 
     ranked = list(enumerate(final_scores))
     ranked.sort(key=lambda item: item[1], reverse=True)
@@ -373,6 +405,7 @@ def similar_courses(
     top_k: int = Query(10, ge=1, le=100),
     mode: Literal["dense", "sparse", "hybrid"] = Query("sparse"),
     alpha: float = Query(0.0, ge=0.0, le=1.0),
+    fusion: Literal["linear", "rrf"] = Query("linear"),
 ) -> SimilarResponse:
     # Retrieve nearest courses by using the selected course text as query.
     if course_id not in COURSES:
@@ -384,6 +417,7 @@ def similar_courses(
         top_k=top_k,
         mode=mode,
         alpha=alpha,
+        fusion=fusion,
         exclude_course_id=course_id,
     )
 
@@ -401,9 +435,10 @@ def search_courses(
     top_k: int = Query(10, ge=1, le=100),
     mode: Literal["dense", "sparse", "hybrid"] = Query("sparse"),
     alpha: float = Query(0.0, ge=0.0, le=1.0),
+    fusion: Literal["linear", "rrf"] = Query("linear"),
 ) -> SearchResponse:
     # Free-text course search endpoint used by evaluation/UI.
-    ranked = rank_courses_for_query(query=query, top_k=top_k, mode=mode, alpha=alpha)
+    ranked = rank_courses_for_query(query=query, top_k=top_k, mode=mode, alpha=alpha, fusion=fusion)
 
     results = [
         CourseResult(course_id=cid, title=str(COURSES[cid]["title"]), score=round(score, 3))
@@ -419,9 +454,10 @@ def search_objectives(
     top_k: int = Query(10, ge=1, le=100),
     mode: Literal["dense", "sparse", "hybrid"] = Query("sparse"),
     alpha: float = Query(0.0, ge=0.0, le=1.0),
+    fusion: Literal["linear", "rrf"] = Query("linear"),
 ) -> ObjectivesSearchResponse:
     # Free-text objective search returning (course, objective) matches.
-    ranked = rank_objectives_for_query(query=query, top_k=top_k, mode=mode, alpha=alpha)
+    ranked = rank_objectives_for_query(query=query, top_k=top_k, mode=mode, alpha=alpha, fusion=fusion)
 
     results = [
         ObjectiveResult(
