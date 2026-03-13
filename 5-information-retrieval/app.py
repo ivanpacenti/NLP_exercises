@@ -12,6 +12,10 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
+#Sparse retrieval using BM25 on tokenized course texts with bigrams.
+#Dense retrieval where each document is represented as a fixed-size vector using feature hashing.
+#Hybrid retrieval combining sparse and dense scores using either weighted averaging or reciprocal rank fusion.
+
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 DENSE_DIM = 256
 DATA_PATH = Path(__file__).with_name("dtu_courses.jsonl")
