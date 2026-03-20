@@ -35,7 +35,7 @@ def _extract_content(response: dict) -> str:
     raise ValueError(f"Unexpected CampusAI response structure: {response}")
 
 def _parse_entities(content: str) -> dict[str, list[str]]:
-    # Try to read the model output as JSON and keep only the fields we need.
+    # Parse the LLM output and keep only items and properties.
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -102,13 +102,13 @@ def _simplify_bindings(bindings: list[dict]) -> list[dict[str, str]]:
         simplified.append(simplified_row)
     return simplified
 
-
+# Get only the entity/property id from the full URI
 def _extract_id_from_uri(uri: str) -> str:
     if not uri:
         return ""
     return uri.rstrip("/").rsplit("/", 1)[-1]
 
-
+# Lowercase the text and remove extra spaces
 def _normalize_lookup_text(text: str) -> str:
     return " ".join(text.casefold().split())
 
