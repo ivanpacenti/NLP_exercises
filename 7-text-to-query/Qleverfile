@@ -1,0 +1,21 @@
+[data]
+NAME = keyboards
+DESCRIPTION = Keyboards Wikibase snapshot
+
+[index]
+INPUT_FILES = keyboards.nt
+CAT_INPUT_FILES = cat keyboards.nt
+
+[server]
+PORT = 7070
+TIMEOUT = 30s
+
+[runtime]
+SYSTEM = docker
+IMAGE = docker.io/adfreiburg/qlever:latest
+
+[ui]
+UI_CONFIG = default
+UI_PORT = 8176
+UI_SYSTEM = docker
+UI_IMAGE = docker.io/adfreiburg/qlever-ui
