@@ -133,7 +133,7 @@ def _candidate_score(candidate: dict[str, str], query_text: str) -> tuple[int, i
     exact_label_match = int(normalized_label == normalized_query)
     statement_count = int(float(candidate.get("statement_count", "0") or 0))
     candidate_id = candidate.get("id", "")
-    return (exact_label_match, statement_count, candidate_id)
+    return exact_label_match, statement_count, candidate_id
 
 
 def _pick_best_candidate(candidates: list[dict[str, str]], query_text: str) -> str:
